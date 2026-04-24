@@ -1,0 +1,293 @@
+diff --git a/include/uapi/linux/k22info.h b/include/uapi/linux/k22info.h
+new file mode 100644
+index 000000000..a2122aba2
+--- /dev/null
++++ b/include/uapi/linux/k22info.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_LINUX_K22INFO_H
++#define _UAPI_LINUX_K22INFO_
++
++#include <linux/types.h>
++
++struct k22info {
++	 char comm[64];                  /* name of the executable */
++	pid_t pid;                      /* process ID */
++	pid_t parent_pid;               /* parent process ID */
++	pid_t first_child_pid;          /* PID of first child */
++	pid_t next_sibling_pid;         /* PID of next sibling */
++	unsigned long nvcsw;            /* number of voluntary context switches */
++	unsigned long nivcsw;           /* number of involuntary context switches */
++	unsigned long start_time;       /* monotonic start time in nanoseconds */
++};
++
++#endif /* _UAPI_LINUX_K22INFO_H */
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 87866b037..d66149391 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -10,7 +10,7 @@ obj-y     = fork.o exec_domain.o panic.o \
+ 	    extable.o params.o \
+ 	    kthread.o sys_ni.o nsproxy.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+-	    async.o range.o smpboot.o ucount.o regset.o ksyms_common.o
++	    async.o range.o smpboot.o ucount.o regset.o ksyms_common.o k22tree.o
+ 
+ obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
+ obj-$(CONFIG_MULTIUSER) += groups.o
+diff --git a/kernel/k22tree.c b/kernel/k22tree.c
+new file mode 100644
+index 000000000..7bd09a526
+--- /dev/null
++++ b/kernel/k22tree.c
+@@ -0,0 +1,240 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * k22tree system-call implementation
++ */
++
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/uaccess.h>
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/k22info.h>
++
++static int do_k22tree(struct k22info __user *buf, int __user *ne);
++static void fill_entry(struct k22info *entry, struct task_struct *task);
++
++/**
++ * Helper function for do_k22tree.
++ * Gets a k22info entry and a task_struct task and
++ * fills the entry with the appropriate task_struct fields.
++ */
++static void fill_entry(struct k22info *entry, struct task_struct *task)
++{
++	struct task_struct *child, *sibl;
++	struct task_struct *parent_leader;
++
++	/* initialize entry to avoid garbage values */
++	memset(entry, 0, sizeof(*entry));
++
++	/* name */
++	strscpy(entry->comm, task->comm, TASK_COMM_LEN);
++	entry->comm[TASK_COMM_LEN - 1] = '\0';
++
++	entry->pid = task_pid_nr(task);
++
++	/* set the parent as the group leader
++	 * to ensure that also thread-forked processes
++	 * have a parent(the group leader)
++	 */
++	if (task->real_parent) {
++		parent_leader = task->real_parent->group_leader;
++		entry->parent_pid = task_pid_nr(parent_leader);
++	} else {
++		entry->parent_pid = 0;
++	}
++
++	/* first child */
++	if (list_empty(&task->children)) {
++		entry->first_child_pid = 0;
++	} else {
++		child = list_first_entry(&task->children, struct task_struct,
++					 sibling);
++		entry->first_child_pid = task_pid_nr(child);
++	}
++
++	/* next sibling */
++	if (!task->real_parent ||
++	    list_is_last(&task->sibling, &task->real_parent->children)) {
++		entry->next_sibling_pid = 0;
++	} else {
++		sibl = list_next_entry(task, sibling);
++		entry->next_sibling_pid = task_pid_nr(sibl);
++	}
++
++	entry->nvcsw = task->nvcsw;
++	entry->nivcsw = task->nivcsw;
++	entry->start_time = task->start_time;
++}
++
++/*
++ * Gets a buffer and a number of entries from user space,
++ * computes total number of processes in the system
++ * and updates user buf with ne processes or with all
++ * the processes of the system if ne is greater than that.
++ *
++ * @buf: user pointer to array of struct k22info.
++ *
++ * @ne:  user pointer to int specifying capacity;
++ * on success overwritten with number written.
++ * @return: the total number of processes in the system or negative errno.
++ */
++int do_k22tree(struct k22info __user *buf, int __user *ne)
++{
++	int top;
++	int user_ne;
++	int count = 0;
++	int return_value = 0;
++	struct task_struct *task, *child, *thread;
++	struct task_struct **stack = NULL;
++	struct task_struct *task_count;
++	struct k22info entry;
++	struct k22info *kbuf = NULL;
++	int estimated_processes;
++	int processes_count;
++
++	/* get the ne from user-space */
++	if (copy_from_user(&user_ne, ne, sizeof(user_ne))) {
++		return_value = -EFAULT;
++		goto out;
++	}
++
++	/* check if user_ne is valid input */
++	if (user_ne <= 0) {
++		return_value = -EINVAL;
++		goto out;
++	}
++
++	/* ensure buffer is accessible for writing */
++	if (!access_ok(buf, user_ne * sizeof(struct k22info))) {
++		return_value = -EFAULT;
++		goto out;
++	}
++
++	processes_count = 1; /* start from 1 to include swapper */
++
++	/* get total number of processes in system to estimate space needed */
++	read_lock(&tasklist_lock);
++	for_each_process(task_count) {
++		processes_count++;
++	}
++	read_unlock(&tasklist_lock);
++
++	/* estimated number of processes so as to allocate space */
++	estimated_processes = (processes_count * 2) + 1000;
++
++	/*
++	 * allocate a buffer which will store the processes and
++	 * their info to return them back to user-space at the end
++	 */
++	kbuf = kmalloc_array(estimated_processes, sizeof(*kbuf), GFP_KERNEL);
++	if (!kbuf) {
++		return_value = -ENOMEM;
++		goto out;
++	}
++
++	/* a stack to store processes and threads for DFS */
++	stack = kmalloc_array((estimated_processes * 2), sizeof(*stack),
++			      GFP_KERNEL);
++	if (!stack) {
++		return_value = -ENOMEM;
++		goto free_kbuf;
++	}
++
++	/* DFS pre-order using stack */
++	top = 0;
++	stack[0] = &init_task;
++	processes_count = 1; /* start from 1 to include swapper */
++
++	read_lock(&tasklist_lock);
++
++	for_each_process(task_count) {
++		processes_count++;
++	}
++
++	/* while the stack has processes or threads inside */
++	while (top >= 0) {
++		task = stack[top--];
++
++		/* skip threads - don't output them, just process their children */
++		if (!thread_group_leader(task)) {
++
++			/* push all children of this thread */
++			list_for_each_entry_reverse(child, &task->children,
++						    sibling) {
++
++				/* check for stack overflow */
++				if (top >= (estimated_processes * 2) - 1) {
++					read_unlock(&tasklist_lock);
++					return_value = -ENOMEM;
++					goto free_stack;
++				}
++
++				stack[++top] = child;
++			}
++			continue;
++		}
++
++		/* if count has reached the limit of ne given by the user */
++		if (count >= user_ne)
++			break;
++
++		fill_entry(&entry, task);
++		kbuf[count++] = entry;
++
++		/* push all threads of this process first */
++		list_for_each_entry_reverse(thread, &task->signal->thread_head,
++					    thread_node) {
++
++			if (thread != task) { /* skip the leader */
++
++				/* check for stack overflow */
++				if (top >= (estimated_processes * 2) - 1) {
++					read_unlock(&tasklist_lock);
++					return_value = -ENOMEM;
++					goto free_stack;
++				}
++				stack[++top] = thread;
++			}
++		}
++
++		/* push children secondly so they pop first */
++		list_for_each_entry_reverse(child, &task->children, sibling) {
++
++			/* check for stack overflow */
++			if (top >= (estimated_processes * 2) - 1) {
++				read_unlock(&tasklist_lock);
++				return_value = -ENOMEM;
++				goto free_stack;
++			}
++			stack[++top] = child;
++		}
++	}
++
++	read_unlock(&tasklist_lock);
++
++	/* copy count back to user */
++	if (copy_to_user(ne, &count, sizeof(count))) {
++		return_value = -EFAULT;
++		goto free_stack;
++	}
++
++	/* copy kbuf back to user */
++	if (copy_to_user(buf, kbuf, count * sizeof(*kbuf))) {
++		return_value = -EFAULT;
++		goto free_stack;
++	}
++
++	return_value = processes_count;
++
++free_stack:
++	kfree(stack);
++free_kbuf:
++	kfree(kbuf);
++out:
++	return return_value;
++}
++
++SYSCALL_DEFINE2(k22tree, struct k22info __user *, buf, int __user *, ne)
++{
++	return do_k22tree(buf, ne);
++}
+diff --git a/scripts/syscall.tbl b/scripts/syscall.tbl
+index ebbdb3c42..9fc6346ce 100644
+--- a/scripts/syscall.tbl
++++ b/scripts/syscall.tbl
+@@ -407,3 +407,4 @@
+ 464	common	getxattrat			sys_getxattrat
+ 465	common	listxattrat			sys_listxattrat
+ 466	common	removexattrat			sys_removexattrat
++467 common  sys_k22tree         sys_k22tree
+\ No newline at end of file
