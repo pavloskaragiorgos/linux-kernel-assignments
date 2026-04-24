@@ -37,7 +37,8 @@ Each `struct k22info` entry (defined in `include/uapi/linux/k22info.h`) captures
 ## Assignment 2 — `SCHED_GRR`: Group Round-Robin Scheduler
 **Note:** The patch for this assignment is not publicly available at the professor's
 request, to preserve the assignment integrity for future students.
-The description below documents the design and implementation for reference.
+The description below documents the design and implementation for reference. 
+This assignment received a grade of 100%.
 
 ### Overview
 
